@@ -20,7 +20,7 @@ flowchart LR
   subgraph UserFacing["User-facing"]
     CLI["openai-cli\n(readline chat)"]
     Runner["run.ts harness"]
-    Assignment["index.ts\nassignment suite"]
+    IndexEntry["index.ts\nintegration suite"]
   end
 
   subgraph Cloud["External services"]
@@ -33,13 +33,13 @@ flowchart LR
   OAI -->|"tool calls"| CLI
   CLI --> CP
   Runner --> Agent["runAgent()\nagent.ts"]
-  Assignment --> Suite["runAssignmentSuite()\nagent.ts"]
+  IndexEntry --> Suite["suite runner\nagent.ts"]
   Agent --> CP
   Suite --> CP
   CP --> GAPI
 ```
 
-**Idea:** One **shared integration layer** in `agent.ts` (`composioProxyExecute`, account routing, path normalization) so the **assignment tests**, the **batch endpoint report**, and the **OpenAI CLI** never duplicate OAuth or URL quirks.
+**Idea:** One **shared integration layer** in `agent.ts` (`composioProxyExecute`, account routing, path normalization) so the **integration tests**, the **batch endpoint report**, and the **OpenAI CLI** never duplicate OAuth or URL quirks.
 
 ### 1.2 Major subsystems
 
@@ -98,7 +98,7 @@ flowchart TB
 | `types.ts` | `EndpointDefinition`, `EndpointReport`, `TestReport`, `EndpointStatus` — contract for the harness output. |
 | `endpoints.json` | List of endpoints (method, path, parameters, scopes) fed to `runAgent`. |
 | `run.ts` | Loads endpoints, invokes `runAgent`, validates report shape, writes `report.json`. **Not** meant to be modified for solutions. |
-| `agent.ts` | Composio helpers, `runAgent`, assignment suite (`runAssignmentSuite`), Gmail/Calendar test helpers, `executeSlug` + classification + redaction. |
+| `agent.ts` | Composio helpers, `runAgent`, integration suite runner (Gmail/Calendar checks from `index.ts`), Gmail/Calendar test helpers, `executeSlug` + classification + redaction. |
 | `openai-cli.ts` | OpenAI tools schema, `runTool`, `chatTurn`, compression helpers, system prompt. |
 | `connect.ts` | OAuth link flow to obtain connected-account IDs (used operationally; not part of the diagram’s “core logic” loop). |
 
@@ -189,18 +189,18 @@ sequenceDiagram
   R->>R: validate + write report.json
 ```
 
-### 3.2 Assignment suite (`bun src/index.ts`)
+### 3.2 Integration suite (`bun src/index.ts`)
 
 ```mermaid
 flowchart TD
-  Start([runAssignmentSuite]) --> Load[Create Composio client + load toolkit map]
-  Load --> Assert[assertAssignmentAccounts]
+  Start([suite runner]) --> Load[Create Composio client + load toolkit map]
+  Load --> Assert[validate toolkit accounts]
   Assert --> Tests[Sequential tests]
   Tests --> T1[testGmailSendEmail]
   T1 --> T2[testGmailReadEmails]
   T2 --> T3[testCalendarCreateEvent]
   T3 --> T4[testCalendarListEvents]
-  T4 --> Print[printAssignmentResults]
+  T4 --> Print[print suite results]
   Print --> End([PASS/FAIL list])
 ```
 
