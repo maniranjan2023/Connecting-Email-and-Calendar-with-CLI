@@ -1,0 +1,19 @@
+{
+  "name": "endpoint-tester-interview",
+  "private": true,
+  "scripts": {
+    "test:assignment": "bun src/index.ts",
+    "test:endpoints": "bun src/run.ts",
+    "endpoints:list": "bun src/summarize-endpoints.ts",
+    "connect": "bun src/connect.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@composio/core": "latest"
+  }
+}
