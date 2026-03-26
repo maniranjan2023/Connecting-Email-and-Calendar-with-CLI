@@ -18,6 +18,20 @@ const TEST_EMAIL_SUBJECT = "API Test Email";
 const TEST_EMAIL_BODY = "This is a test";
 const TEST_EVENT_TITLE = "API Test Event";
 
+/** Recipient for the Send Email test — set `GMAIL_RECIPIENT_EMAIL` in `.env` (Bun loads it automatically). */
+function readGmailRecipientFromEnv(): string {
+  const v = process.env.GMAIL_RECIPIENT_EMAIL?.trim();
+  if (!v) {
+    throw new Error(
+      "Set GMAIL_RECIPIENT_EMAIL in your project `.env` (who should receive the test email)."
+    );
+  }
+  if (!v.includes("@")) {
+    throw new Error("GMAIL_RECIPIENT_EMAIL in `.env` must look like an email address.");
+  }
+  return v;
+}
+
 function requireApiKey(): void {
   if (!process.env.COMPOSIO_API_KEY?.trim()) {
     throw new Error("Set COMPOSIO_API_KEY (e.g. in .env or your shell).");
@@ -29,15 +43,126 @@ export function createComposioClient(): Composio {
   return new Composio();
 }
 
+/** Legacy fallback (often the Composio *user id* from connect — not the connected-account nanoid). */
 export function getConnectedAccountId(): string {
   return process.env.COMPOSIO_CONNECTED_ACCOUNT_ID?.trim() || "candidate";
 }
 
-type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+/**
+ * Per-toolkit Composio connected-account ids (from `waitForConnection().id` or dashboard).
+ * Gmail and Calendar are separate connections → usually two different ids.
+ */
+export type ToolkitAccountMap = {
+  gmail?: string;
+  googlecalendar?: string;
+};
+
+function normalizeToolkitSlug(raw: string | undefined): string | null {
+  if (!raw) return null;
+  return raw.toLowerCase().replace(/-/g, "_");
+}
+
+/**
+ * Resolves Gmail / Google Calendar connected-account ids from env and/or active connections for `COMPOSIO_USER_ID`.
+ */
+export async function loadToolkitAccountMap(composio: Composio): Promise<ToolkitAccountMap> {
+  const map: ToolkitAccountMap = {};
+  const fromG = process.env.COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID?.trim();
+  const fromC = process.env.COMPOSIO_GOOGLECALENDAR_CONNECTED_ACCOUNT_ID?.trim();
+  if (fromG) map.gmail = fromG;
+  if (fromC) map.googlecalendar = fromC;
+  if (map.gmail && map.googlecalendar) return map;
+
+  const userId = process.env.COMPOSIO_USER_ID?.trim() || "candidate";
+  try {
+    const res = await composio.connectedAccounts.list({
+      userIds: [userId],
+      statuses: ["ACTIVE"],
+    });
+    for (const item of res.items) {
+      const slug = normalizeToolkitSlug(item.toolkit?.slug);
+      if (slug === "gmail" && !map.gmail) map.gmail = item.id;
+      if (
+        (slug === "googlecalendar" || slug === "google_calendar") &&
+        !map.googlecalendar
+      ) {
+        map.googlecalendar = item.id;
+      }
+    }
+  } catch {
+    /* env may still be enough */
+  }
+
+  return map;
+}
+
+function pickConnectedAccountId(
+  map: ToolkitAccountMap,
+  endpoint: string,
+  fallback: string
+): string {
+  if (endpoint.startsWith("/gmail/")) {
+    return map.gmail ?? fallback;
+  }
+  if (
+    endpoint.startsWith("/calendar/") ||
+    endpoint.startsWith("/calendars/") ||
+    endpoint.startsWith("/users/me/calendar")
+  ) {
+    return map.googlecalendar ?? fallback;
+  }
+  return fallback;
+}
+
+/**
+ * Composio's Calendar toolkit proxy already targets a base URL that includes
+ * `/calendar/v3`. Passing full OpenAPI paths duplicates the segment and yields 404s
+ * like `/calendar/v3/calendar/v3/calendars/...`.
+ */
+function normalizeProxyEndpoint(endpoint: string): string {
+  if (endpoint === "/calendar/v3") return "/";
+  if (endpoint.startsWith("/calendar/v3/")) {
+    return endpoint.slice("/calendar/v3".length);
+  }
+  return endpoint;
+}
+
+export function assertAssignmentAccounts(map: ToolkitAccountMap): void {
+  const missing: string[] = [];
+  if (!map.gmail) {
+    missing.push(
+      "Gmail: set COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID, or run `bun run connect` and copy the id from the log (same COMPOSIO_USER_ID, default `candidate`)."
+    );
+  }
+  if (!map.googlecalendar) {
+    missing.push(
+      "Calendar: set COMPOSIO_GOOGLECALENDAR_CONNECTED_ACCOUNT_ID, or connect Calendar and copy the id from the log."
+    );
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      [
+        "Composio rejected calls: `connectedAccountId` must be each toolkit’s connected-account id (nanoid), not your user label like \"candidate\".",
+        "",
+        ...missing.map((m) => `• ${m}`),
+      ].join("\n")
+    );
+  }
+}
+
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+
+export type ComposioProxyRequest = {
+  endpoint: string;
+  method: HttpMethod;
+  parameters?: Array<{ in: "query" | "header"; name: string; value: string | number }>;
+  body?: unknown;
+};
 
 async function toolProxy(
   composio: Composio,
-  connectedAccountId: string,
+  map: ToolkitAccountMap,
+  accountFallback: string,
   args: {
     endpoint: string;
     method: HttpMethod;
@@ -45,13 +170,30 @@ async function toolProxy(
     body?: unknown;
   }
 ) {
+  const connectedAccountId = pickConnectedAccountId(map, args.endpoint, accountFallback);
+  const endpoint = normalizeProxyEndpoint(args.endpoint);
   return composio.tools.proxyExecute({
-    endpoint: args.endpoint,
+    endpoint,
     method: args.method,
     connectedAccountId,
     parameters: args.parameters,
     body: args.body,
   });
+}
+
+/** Escape hatch for OpenAI tool runner — same path normalization + account routing as tests. */
+export async function composioProxyExecute(
+  composio: Composio,
+  map: ToolkitAccountMap,
+  accountFallback: string,
+  request: ComposioProxyRequest
+) {
+  return toolProxy(composio, map, accountFallback, request);
+}
+
+/** Build Gmail `raw` payload for messages/send. */
+export function encodeGmailMessageRaw(to: string, subject: string, bodyText: string): string {
+  return gmailRfc2822Raw(to, subject, bodyText);
 }
 
 function gmailRfc2822Raw(to: string, subject: string, bodyText: string): string {
@@ -68,12 +210,13 @@ function gmailRfc2822Raw(to: string, subject: string, bodyText: string): string 
 
 async function resolveSelfEmail(
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string
 ): Promise<string> {
   const fromEnv = process.env.GMAIL_SELF_EMAIL?.trim();
   if (fromEnv) return fromEnv;
 
-  const res = await toolProxy(composio, connectedAccountId, {
+  const res = await toolProxy(composio, map, accountFallback, {
     endpoint: "/gmail/v1/users/me/profile",
     method: "GET",
   });
@@ -91,14 +234,19 @@ async function resolveSelfEmail(
 
 export async function testGmailSendEmail(
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string,
+  recipientEmail: string
 ): Promise<AssignmentTestResult> {
   const name = "Send Email";
   try {
-    const to = await resolveSelfEmail(composio, connectedAccountId);
+    const to = recipientEmail.trim();
+    if (!to.includes("@")) {
+      return { name, success: false, details: "Invalid recipient email." };
+    }
     const raw = gmailRfc2822Raw(to, TEST_EMAIL_SUBJECT, TEST_EMAIL_BODY);
 
-    const send = await toolProxy(composio, connectedAccountId, {
+    const send = await toolProxy(composio, map, accountFallback, {
       endpoint: "/gmail/v1/users/me/messages/send",
       method: "POST",
       body: { raw },
@@ -112,7 +260,7 @@ export async function testGmailSendEmail(
       };
     }
 
-    const list = await toolProxy(composio, connectedAccountId, {
+    const list = await toolProxy(composio, map, accountFallback, {
       endpoint: "/gmail/v1/users/me/messages",
       method: "GET",
       parameters: [
@@ -158,11 +306,12 @@ export async function testGmailSendEmail(
 
 export async function testGmailReadEmails(
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string
 ): Promise<AssignmentTestResult> {
   const name = "Read Emails";
   try {
-    const res = await toolProxy(composio, connectedAccountId, {
+    const res = await toolProxy(composio, map, accountFallback, {
       endpoint: "/gmail/v1/users/me/messages",
       method: "GET",
       parameters: [{ in: "query", name: "maxResults", value: 5 }],
@@ -191,7 +340,8 @@ export async function testGmailReadEmails(
 
 export async function testCalendarCreateEvent(
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string
 ): Promise<AssignmentTestResult> {
   const name = "Create Event";
   try {
@@ -205,7 +355,7 @@ export async function testCalendarCreateEvent(
       end: { dateTime: end.toISOString(), timeZone: tz },
     };
 
-    const create = await toolProxy(composio, connectedAccountId, {
+    const create = await toolProxy(composio, map, accountFallback, {
       endpoint: "/calendar/v3/calendars/primary/events",
       method: "POST",
       body,
@@ -226,7 +376,7 @@ export async function testCalendarCreateEvent(
     }
 
     const path = `/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`;
-    const get = await toolProxy(composio, connectedAccountId, {
+    const get = await toolProxy(composio, map, accountFallback, {
       endpoint: path,
       method: "GET",
     });
@@ -255,12 +405,13 @@ export async function testCalendarCreateEvent(
 
 export async function testCalendarListEvents(
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string
 ): Promise<AssignmentTestResult> {
   const name = "List Events";
   try {
     const timeMin = new Date().toISOString();
-    const res = await toolProxy(composio, connectedAccountId, {
+    const res = await toolProxy(composio, map, accountFallback, {
       endpoint: "/calendar/v3/calendars/primary/events",
       method: "GET",
       parameters: [
@@ -308,13 +459,17 @@ function printAssignmentResults(results: AssignmentTestResult[]): void {
  */
 export async function runAssignmentSuite(): Promise<AssignmentTestResult[]> {
   const composio = createComposioClient();
-  const id = getConnectedAccountId();
+  const accountFallback = getConnectedAccountId();
+  const map = await loadToolkitAccountMap(composio);
+  assertAssignmentAccounts(map);
+
+  const recipientEmail = readGmailRecipientFromEnv();
 
   const results: AssignmentTestResult[] = [];
-  results.push(await testGmailSendEmail(composio, id));
-  results.push(await testGmailReadEmails(composio, id));
-  results.push(await testCalendarCreateEvent(composio, id));
-  results.push(await testCalendarListEvents(composio, id));
+  results.push(await testGmailSendEmail(composio, map, accountFallback, recipientEmail));
+  results.push(await testGmailReadEmails(composio, map, accountFallback));
+  results.push(await testCalendarCreateEvent(composio, map, accountFallback));
+  results.push(await testCalendarListEvents(composio, map, accountFallback));
 
   printAssignmentResults(results);
   return results;
@@ -388,7 +543,8 @@ async function executeSlug(
   ep: EndpointDefinition,
   ctx: ExecCtx,
   composio: Composio,
-  connectedAccountId: string
+  map: ToolkitAccountMap,
+  accountFallback: string
 ): Promise<{ http: number; body: unknown }> {
   const method = ep.method.toUpperCase() as HttpMethod;
   const vars: Record<string, string | undefined> = {
@@ -404,13 +560,13 @@ async function executeSlug(
 
   switch (ep.tool_slug) {
     case "GMAIL_SEND_MESSAGE": {
-      const to = ctx.userEmail ?? (await resolveSelfEmail(composio, connectedAccountId));
+      const to = ctx.userEmail ?? (await resolveSelfEmail(composio, map, accountFallback));
       ctx.userEmail = ctx.userEmail ?? to;
       body = { raw: gmailRfc2822Raw(to, "Endpoint tester", "ping") };
       break;
     }
     case "GMAIL_CREATE_DRAFT": {
-      const to = ctx.userEmail ?? (await resolveSelfEmail(composio, connectedAccountId));
+      const to = ctx.userEmail ?? (await resolveSelfEmail(composio, map, accountFallback));
       ctx.userEmail = ctx.userEmail ?? to;
       body = {
         message: { raw: gmailRfc2822Raw(to, "Draft ping", "draft body") },
@@ -454,7 +610,7 @@ async function executeSlug(
   }
 
   try {
-    const res = await toolProxy(composio, connectedAccountId, {
+    const res = await toolProxy(composio, map, accountFallback, {
       endpoint,
       method,
       parameters,
@@ -515,6 +671,7 @@ export async function runAgent(params: {
   const ctx: ExecCtx = {};
   const results: EndpointReport[] = [];
   const ts = new Date().toISOString();
+  const map = await loadToolkitAccountMap(params.composio);
 
   const slugsToRun = [
     ...RUN_ORDER.filter((s) => bySlug.has(s)),
@@ -524,7 +681,13 @@ export async function runAgent(params: {
   for (const slug of slugsToRun) {
     const ep = bySlug.get(slug);
     if (!ep) continue;
-    const { http, body } = await executeSlug(ep, ctx, params.composio, params.connectedAccountId);
+    const { http, body } = await executeSlug(
+      ep,
+      ctx,
+      params.composio,
+      map,
+      params.connectedAccountId
+    );
     const { status, summary } = classifyStatus(http);
     results.push({
       tool_slug: ep.tool_slug,

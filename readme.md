@@ -1,318 +1,283 @@
-# API Endpoint Executability Validator Agent
+# Endpoint Tester — Architecture & Design
 
-**Role:** Agents Engineer | **Duration:** 90 minutes | **Format:** Hands-on implementation with an AI coding agent
+This repository combines two related capabilities:
+
+1. **Endpoint executability validation** — Given structured API endpoint definitions (Gmail + Google Calendar in the sample), the agent calls each through Composio’s authenticated proxy and classifies whether the call succeeded, failed due to missing routes/scopes, or failed for other reasons.
+2. **Natural-language assistant** — A separate CLI uses OpenAI tool-calling to drive the **same** Composio proxy layer for real Gmail and Calendar actions (list/read/send mail, list/create calendar events).
+
+The sections below describe **high-level design (HLD)**, **low-level design (LLD)**, and **workflows** in plain language. Setup steps and environment variables are intentionally omitted here.
 
 ---
 
-## Context
+## 1. High-level design (HLD)
 
-At Composio, we integrate with 2,000+ apps and 42,000+ API endpoints. Before we build an integration for any endpoint, we need to verify that the endpoint can actually be executed successfully — that it exists, the auth works, and a well-formed request gets a valid response.
+### 1.1 System context
 
-Your job is to **build an agent that automates this verification**. Given a set of API endpoint definitions for any app, your agent should attempt to execute each one and determine:
+At a high level, everything sits between **your code**, **OpenAI** (only for the chat CLI), and **Google APIs** — with **Composio** in the middle holding OAuth tokens and exposing a single `proxyExecute` surface.
 
-- Can this endpoint be successfully called at least once? If yes, it's **valid**.
-- Does this endpoint actually exist? If not, it's **invalid** (fake/wrong path/wrong method).
-- Does the connected account have the right permissions? If not, it's an **auth/scope issue**.
-- Did something else go wrong? If so, capture the error.
+```mermaid
+flowchart LR
+  subgraph UserFacing["User-facing"]
+    CLI["openai-cli\n(readline chat)"]
+    Runner["run.ts harness"]
+    Assignment["index.ts\nassignment suite"]
+  end
 
-**This is not about testing business logic or edge cases.** You're doing a single-request sanity check: "Can I successfully execute this endpoint with a reasonable request?" If you get one successful response, that endpoint passes. If the endpoint is genuinely broken or doesn't exist, your agent should recognize that and report it clearly.
+  subgraph Cloud["External services"]
+    OAI["OpenAI\nChat Completions"]
+    CP["Composio\nproxyExecute"]
+    GAPI["Google APIs\nGmail / Calendar"]
+  end
 
-## What makes this hard
-
-Some endpoints are **fake** — they don't exist in the real API. Your agent needs to tell the difference between "this endpoint doesn't exist" and "I called it wrong."
-
-Some endpoints have **dependencies** — you can't call `GET /messages/{messageId}` without first calling `GET /messages` to get a valid ID. Your agent needs to figure this out dynamically, for any app.
-
-Some endpoints need **request bodies** — your agent needs to construct minimal valid payloads based on the parameter definitions.
-
-Some endpoints will fail due to **insufficient scopes** — the connected account may not have the right permissions. Your agent should detect this (typically a 403) and classify it correctly, not keep retrying.
-
-Your agent should handle all of this for **any app** — not just the sample Gmail/Calendar endpoints. Don't hardcode app-specific logic.
-
-## Sample data
-
-You're given 16 sample endpoints in `src/endpoints.json`: 10 Gmail + 6 Google Calendar. The mix includes:
-- Valid endpoints that should return successful responses
-- Fake endpoints that don't exist in the real API
-- Endpoints that may fail due to missing scopes
-
-Use these to develop and sanity-check your solution. But keep in mind: **we will run your agent against other apps and endpoints during evaluation.**
-
-### Endpoint definition format
-
-Each endpoint in `endpoints.json` looks like this:
-
-```json
-{
-  "tool_slug": "GMAIL_LIST_MESSAGES",
-  "description": "Lists the messages in the user's mailbox.",
-  "method": "GET",
-  "path": "/gmail/v1/users/me/messages",
-  "required_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
-  "parameters": {
-    "query": [
-      { "name": "maxResults", "type": "integer", "required": false, "description": "Maximum number of messages to return." }
-    ],
-    "path": [],
-    "body": null
-  }
-}
+  CLI --> OAI
+  OAI -->|"tool calls"| CLI
+  CLI --> CP
+  Runner --> Agent["runAgent()\nagent.ts"]
+  Assignment --> Suite["runAssignmentSuite()\nagent.ts"]
+  Agent --> CP
+  Suite --> CP
+  CP --> GAPI
 ```
 
-- `tool_slug` — a unique identifier for the endpoint (used in reporting, not for execution)
-- `method` + `path` — the actual HTTP endpoint to call
-- `required_scopes` — what permissions the endpoint needs
-- `parameters` — query params, path params (like `{messageId}`), and request body schema
-
-## How to call endpoints: `proxyExecute()`
-
-Use `composio.tools.proxyExecute()` to call endpoints. You give it the HTTP method and path, and Composio handles all authentication (OAuth tokens, refresh, etc.) for you.
-
-```typescript
-import { Composio } from "@composio/core";
-
-const composio = new Composio();
-
-// Simple GET request
-const result = await composio.tools.proxyExecute({
-  endpoint: "/gmail/v1/users/me/messages",
-  method: "GET",
-  connectedAccountId: "candidate",
-  parameters: [
-    { in: "query", name: "maxResults", value: 5 }
-  ],
-});
-
-// POST request with a body
-const result = await composio.tools.proxyExecute({
-  endpoint: "/calendar/v3/calendars/primary/events",
-  method: "POST",
-  connectedAccountId: "candidate",
-  body: {
-    summary: "Test Event",
-    start: { dateTime: "2026-03-25T10:00:00Z", timeZone: "UTC" },
-    end: { dateTime: "2026-03-25T11:00:00Z", timeZone: "UTC" },
-  },
-});
-```
-
-**`proxyExecute` parameters:**
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `endpoint` | Yes | API path (e.g., `/gmail/v1/users/me/messages`) |
-| `method` | Yes | `"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, or `"PATCH"` |
-| `connectedAccountId` | Yes | Use `"candidate"` (set up during `setup.sh`) |
-| `parameters` | No | Array of `{ in: "query" \| "header", name, value }` |
-| `body` | No | Request body object for POST/PUT/PATCH |
-
-**Response structure:**
-
-```typescript
-interface ProxyExecuteResponse {
-  status: number;                        // HTTP status code (200, 404, 403, etc.)
-  data?: unknown;                        // Response body (JSON)
-  headers?: Record<string, string>;      // Response headers
-}
-```
-
-Use `result.status` to classify endpoints: 2xx = valid, 404 = invalid, 403 = insufficient scopes, etc.
-
-**Important:**
-- **Do NOT make raw HTTP requests** or extract bearer tokens manually. `proxyExecute()` handles all auth.
-- **Path parameters** (like `{messageId}`) must be substituted into the path string before calling. `proxyExecute` only handles query and header params.
-- **OAuth, token refresh, and rate limits** are handled by Composio — these are out of scope for your agent.
-- **Your agent will take real actions** on the connected Google account (send emails, trash messages, create/delete calendar events). Use a secondary or throwaway Google account if possible.
-
-## Classification
-
-Your agent must classify each endpoint into one of these statuses:
-
-| Status | Meaning | Typical signals |
-|--------|---------|-----------------|
-| `valid` | Endpoint exists and can be successfully executed | Any 2xx response (200, 201, 204, etc.) |
-| `invalid_endpoint` | Endpoint does not exist | 404, "not found", method not allowed |
-| `insufficient_scopes` | Endpoint exists but account lacks permissions | 403, "forbidden", "insufficient permissions" |
-| `error` | Something else went wrong | 400, 500, timeouts, malformed responses |
-
-**What counts as "valid":** Any 2xx response means the endpoint works. Your agent doesn't need to validate the response body or test multiple scenarios — one successful call is enough.
-
-**Key challenge — avoiding false negatives:** The most common mistake is classifying a valid endpoint as `error` because your agent constructed a bad request (wrong params, missing required fields, bad path parameter). Think carefully about how your agent avoids this. A valid endpoint that your agent fails to call correctly is worse than admitting uncertainty.
-
-## Dependency resolution
-
-Some endpoints need data from other endpoints. For example:
-
-```
-GET /gmail/v1/users/me/messages/{messageId}
-```
-
-Your agent can't just make up a `messageId`. It needs to:
-1. Recognize that `{messageId}` is a path parameter
-2. Find another endpoint that can provide a valid message ID (e.g., `GET /messages` → pick an ID from the response)
-3. Substitute the real ID into the path
-4. Then call the endpoint
-
-This "list → pick item → use in detail request" pattern appears across most APIs. Your agent should handle it generically — not just for Gmail messages, but for any resource type in any app.
-
-## Architecture
-
-**One agent per endpoint** — each endpoint should be tested by its own agent instance. Don't use a single agent that sequentially loops through all endpoints.
-
-**No hardcoded execution order** — agents should run in any order (or concurrently). If an agent needs data from another endpoint, it resolves that dependency dynamically.
-
-**Think about how your agent avoids its own mistakes.** The biggest risk isn't fake endpoints — it's your agent misusing valid endpoints (wrong params, bad payload) and then misclassifying them as invalid. Good architectures have strategies for this:
-- How does the agent construct valid requests from the parameter definitions?
-- How does it distinguish "this endpoint doesn't exist" from "I called it wrong"?
-- Does it retry with different parameters before giving up?
-
-We care more about the quality of your architecture than whether you got 100% accuracy on the sample data. **A well-architected agent with a minor bug scores better than a hacky script that gets the right answers on 16 endpoints but would break on the 17th.**
-
-## What you must submit
-
-1. **Your agent implementation** — implement `runAgent()` in `src/agent.ts`
-2. **A test report** — `report.json` generated by `bun src/run.ts`
-3. **An architecture doc** — fill out `ARCHITECTURE.md` in the project root. Explain:
-   - Your agent's design and how it works
-   - How you handle dependency resolution
-   - How you avoid false negatives (misclassifying valid endpoints)
-   - What tradeoffs you made and what you'd improve with more time
-   - Why you chose your particular architecture pattern (single agent, multi-agent, orchestrator, etc.)
-4. **A Loom video** (2–4 minutes) covering:
-   - Walk through your architecture and key design decisions
-   - Explain your dependency resolution strategy
-   - Discuss failure modes — what could go wrong and how your agent handles it
-   - What you'd improve or do differently with more time
-
-The architecture doc and video are **part of your evaluation**. Even if your agent scores perfectly on the sample data, a poor explanation of your architecture will lower your score. Conversely, a thoughtful architecture with a clear explanation can score well even if your agent has a bug that reduces accuracy.
-
-## Evaluation
-
-### How we evaluate
-
-Your agent will be run against the sample Gmail/Calendar endpoints as a sanity check, and then against additional apps and endpoints you haven't seen.
-
-### What we look for
-
-- **Correctness across apps** — How accurately does your agent classify endpoints? Are fake endpoints caught? Are scope issues detected? Does it handle different API styles, error formats, and response structures? This is the most important factor.
-- **Avoiding false negatives** — Does your agent minimize cases where it fails to execute a valid endpoint due to its own mistakes (bad params, missing body, wrong path substitution)?
-- **Dependency resolution** — Can your agent handle endpoints that need data from other endpoints? Does it figure this out dynamically?
-- **Architecture quality** — Is this a real agent with good reasoning, or just a loop? Is the design explained clearly in the architecture doc and video? Would this approach scale to thousands of endpoints across hundreds of apps?
-- **Completeness** — Does every endpoint get tested and reported?
-- **Code quality** — Clean abstractions, good error handling, readable code
-
-### Architecture matters more than score
-
-We evaluate your **thinking and design** as much as your results. A thoughtful, well-explained architecture that would generalize well — but happens to have a bug on the sample data — is more valuable to us than a hardcoded solution that gets 100% on Gmail but would fall apart on Stripe or Jira.
-
-## Constraints
-
-### Use an AI coding agent
-
-Use an AI coding agent to build your solution. Our recommended workflow:
-
-- **[Codex CLI](https://github.com/openai/codex) with GPT-5.3-Codex** for implementation — fast and accurate for coding tasks
-- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code) with Claude Opus 4.6** for high-level planning, architecture design, and writing your `ARCHITECTURE.md`
-
-You're welcome to use whatever AI tools you prefer — [Cursor](https://cursor.com), Windsurf, or any other agent. Use your own API keys / subscriptions. We care about the result, not the specific tool.
-
-**Can't afford API access?** Reach out to **prateek@composio.dev** or **pranjali@composio.dev** — we'll provide API keys so cost isn't a barrier.
-
-### Tech stack
-
-Use **Bun** (not Node.js). The project is already set up for Bun. You are free to use any additional libraries.
-
-## Getting Started
-
-1. **Get your Composio API key** from [platform.composio.dev](https://platform.composio.dev) (free account).
-
-2. **Run the setup script:**
-   ```bash
-   COMPOSIO_API_KEY=<your_key> sh setup.sh
-   ```
-   This installs dependencies, creates auth configs, connects your Google account via OAuth, and runs a sanity check to verify `proxyExecute()` works. The connected account ID is `"candidate"`.
-
-3. **Explore the sample endpoints:**
-   ```bash
-   bun src/index.ts
-   ```
-
-4. **Implement your agent** in `src/agent.ts` (see type definitions in `src/types.ts`).
-
-5. **Run and validate:**
-   ```bash
-   bun src/run.ts
-   ```
-   This calls your `runAgent()`, validates the output, and writes `report.json`.
-
-6. **Write your architecture doc** in `ARCHITECTURE.md`.
-
-## Project Structure
-
-```
-src/
-├── agent.ts          <- YOUR IMPLEMENTATION GOES HERE
-├── types.ts          <- Input/output type definitions (do not modify)
-├── run.ts            <- Runner that calls your agent and validates output (do not modify)
-├── endpoints.json    <- Sample endpoint definitions (Gmail + Google Calendar)
-├── index.ts          <- Prints a summary of endpoints
-└── connect.ts        <- Google OAuth connection setup
-ARCHITECTURE.md       <- YOUR ARCHITECTURE DOC (create this)
-```
-
-### How the runner works
-
-1. `run.ts` loads endpoints from `endpoints.json` and passes them to your `runAgent()` function along with an authenticated Composio client.
-2. Your `runAgent()` tests each endpoint and returns a `TestReport`.
-3. `run.ts` validates the report (all endpoints covered, valid statuses, summary counts match) and writes `report.json`.
-
-You can create additional files and modules — just keep `runAgent()` in `agent.ts` as the entry point.
-
-## Output format
-
-Your agent returns a `TestReport` (see `src/types.ts`). The report JSON looks like:
-
-```json
-{
-  "timestamp": "2026-03-25T10:00:00.000Z",
-  "total_endpoints": 16,
-  "results": [
-    {
-      "tool_slug": "GMAIL_LIST_MESSAGES",
-      "method": "GET",
-      "path": "/gmail/v1/users/me/messages",
-      "status": "valid",
-      "http_status_code": 200,
-      "response_summary": "Returned list of messages successfully",
-      "response_body": { "messages": [{ "id": "19d1b2ff8f72b035", "threadId": "19d1b2fc48ac0f35" }], "resultSizeEstimate": 201 },
-      "required_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
-      "available_scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
-    }
-  ],
-  "summary": {
-    "valid": 13,
-    "invalid_endpoint": 2,
-    "insufficient_scopes": 1,
-    "error": 0
-  }
-}
-```
-
-Each result includes a `response_summary` field. A high-quality summary that explains **why** the endpoint was classified that way (not just the status code, but what the response indicated) is a bonus — think of it as a cherry on top.
-
-## How to Submit
-
-1. **Make sure `report.json` exists** — run `bun src/run.ts` and verify it passes validation.
-
-2. **Make sure `ARCHITECTURE.md` exists** — this is required and will be used in scoring.
-
-3. **Record a Loom video** (2–4 minutes) at [loom.com](https://loom.com) — explain your architecture, decisions, and tradeoffs.
-
-4. **Submit:**
-   ```bash
-   sh upload.sh <your_email> <loom_video_url>
-   ```
-   This uploads your code, report, architecture doc, and agent session traces.
+**Idea:** One **shared integration layer** in `agent.ts` (`composioProxyExecute`, account routing, path normalization) so the **assignment tests**, the **batch endpoint report**, and the **OpenAI CLI** never duplicate OAuth or URL quirks.
+
+### 1.2 Major subsystems
+
+| Subsystem | Role |
+|-----------|------|
+| **Composio client** | Created once; all HTTP to Gmail/Calendar goes through `tools.proxyExecute` with a **connected-account id** per toolkit. |
+| **Toolkit account map** | Resolves **Gmail** vs **Google Calendar** connection IDs — they are usually **different** nanoids for the same human user. |
+| **Proxy routing** | `pickConnectedAccountId` chooses the correct id from the request path prefix (`/gmail/` vs `/calendar/`…). |
+| **Calendar path normalization** | Composio’s Calendar toolkit already uses a base URL that includes `/calendar/v3`. Callers pass full-style paths; `normalizeProxyEndpoint` strips the duplicate segment to avoid `404` from doubled paths. |
+| **Endpoint harness (`runAgent`)** | Iterates endpoint definitions, builds minimal requests, tracks **dependency context** (message IDs, event IDs), classifies HTTP outcomes into `TestReport` statuses. |
+| **OpenAI CLI (`openai-cli.ts`)** | Declares function tools, runs a **multi-round** chat loop, executes tools via `composioProxyExecute`, then a **final** model pass with `tool_choice: "none"` to produce user-visible text. |
+
+### 1.3 Design principles
+
+- **Single source of truth for API access** — `composioProxyExecute` is the only gateway from assistant/tests to Google.
+- **Explicit calendar create policy** — Creating events requires **confirmed timing** (`user_confirmed_timing` + server-side checks) so the model does not invent times.
+- **Context safety** — Large Gmail bodies and tool JSON are **shrunk** before the final LLM call so requests stay within limits and JSON stays **valid** (especially for calendar lists).
 
 ---
 
-*We're evaluating how you think and build with an AI agent. A thoughtful architecture that generalizes is worth more than a perfect score on 16 sample endpoints.*
+## 2. Low-level design (LLD)
+
+### 2.1 Module map
+
+```mermaid
+flowchart TB
+  subgraph Entry["Entry points"]
+    index_ts["index.ts"]
+    run_ts["run.ts"]
+    openai_cli["openai-cli.ts"]
+    connect_ts["connect.ts"]
+  end
+
+  subgraph Core["Core"]
+    agent_ts["agent.ts"]
+    types_ts["types.ts"]
+  end
+
+  subgraph Data["Data"]
+    endpoints_json["endpoints.json"]
+  end
+
+  index_ts --> agent_ts
+  run_ts --> agent_ts
+  run_ts --> endpoints_json
+  openai_cli --> agent_ts
+  connect_ts --> ComposioSDK["@composio/core"]
+
+  agent_ts --> types_ts
+  agent_ts --> ComposioSDK
+  openai_cli --> OpenAISDK["openai"]
+```
+
+| File | Responsibility |
+|------|----------------|
+| `types.ts` | `EndpointDefinition`, `EndpointReport`, `TestReport`, `EndpointStatus` — contract for the harness output. |
+| `endpoints.json` | List of endpoints (method, path, parameters, scopes) fed to `runAgent`. |
+| `run.ts` | Loads endpoints, invokes `runAgent`, validates report shape, writes `report.json`. **Not** meant to be modified for solutions. |
+| `agent.ts` | Composio helpers, `runAgent`, assignment suite (`runAssignmentSuite`), Gmail/Calendar test helpers, `executeSlug` + classification + redaction. |
+| `openai-cli.ts` | OpenAI tools schema, `runTool`, `chatTurn`, compression helpers, system prompt. |
+| `connect.ts` | OAuth link flow to obtain connected-account IDs (used operationally; not part of the diagram’s “core logic” loop). |
+
+### 2.2 `ToolkitAccountMap` and routing
+
+**Data shape:**
+
+- `gmail?: string` — Composio **connected account** id for the Gmail toolkit.
+- `googlecalendar?: string` — Connected account id for Calendar.
+
+**Resolution order (conceptual):** environment overrides first, then listing active connections for `COMPOSIO_USER_ID` if needed.
+
+**Routing rule:** the **HTTP path prefix** of the proxied request decides which id is passed to `proxyExecute`. Paths that look like Calendar (including normalized forms) use the Calendar id; `/gmail/` uses the Gmail id; anything else falls back to a legacy default label.
+
+### 2.3 Calendar path normalization (LLD detail)
+
+Callers may express endpoints as `/calendar/v3/calendars/...`. The proxy already sits under a base that includes `/calendar/v3`. The normalizer:
+
+- Maps `/calendar/v3` → `/`
+- Strips the `/calendar/v3` prefix from longer paths so the final request is not `/calendar/v3/calendar/v3/...`
+
+This is **transparent** to `runAgent` and `openai-cli` as long as they use the shared `composioProxyExecute` entry point.
+
+### 2.4 Endpoint testing: `ExecCtx` and `RUN_ORDER`
+
+`runAgent` keeps a mutable **`ExecCtx`** while iterating slugs:
+
+- Stores **user email** from profile when available.
+- Stores **list message id**, **sent message id**, **event ids** from list/create responses so path parameters like `{messageId}` or `{eventId}` can be filled for dependent calls.
+
+**Order:** A fixed `RUN_ORDER` array defines a **dependency-friendly** sequence (profile → list → get → … → send → … → calendar create → get → delete). Any endpoint not in that list is still appended so nothing is dropped.
+
+For each slug, `executeSlug`:
+
+1. Substitutes path placeholders from `ExecCtx`.
+2. Builds query/header parameters and body **per slug** (minimal valid payloads for send, draft, create event, etc.).
+3. Calls `toolProxy` / `composioProxyExecute`.
+4. Updates `ExecCtx` from successful responses (IDs, email).
+
+### 2.5 Classification (`classifyStatus`)
+
+HTTP status drives coarse **endpoint status**:
+
+- **2xx** → `valid`
+- **404** (and similar “not found” semantics) → `invalid_endpoint`
+- **403** (and forbidden-style cases) → `insufficient_scopes`
+- **Other** → `error`
+
+Responses are **truncated** and **redacted** before landing in `response_body` in the report.
+
+### 2.6 OpenAI CLI: tools and `chatTurn`
+
+**Tools** map 1:1 to `runTool` branches: profile, list messages, get message (with simplified “full” payload for summaries), send email, list events, create event.
+
+**`batchIsOnlyGmailList`:** If the model’s tool batch is **only** `gmail_list_messages`, another round with `tool_choice: "auto"` is allowed so the model can call `gmail_get_message` next. For calendar-only or mixed batches, **`allowTools`** becomes false after executing tools once.
+
+**Final phase:** When `allowTools` is false, the loop **does not** send another tool round first; it:
+
+1. Runs `compressToolMessagesForFinalLlm` — shrinks Gmail `body_text`, and for oversized JSON, **reduces `data.items` for calendar** instead of corrupting JSON with a blind string slice.
+2. Calls the model with `tool_choice: "none"` (non-stream with timeout, then streaming fallback).
+
+**Calendar list:** Successful responses pass through `simplifyCalendarListData` (trim each event to essential fields). **Create:** Rejected unless `user_confirmed_timing === true` in addition to model-provided ISO start/end.
+
+---
+
+## 3. Workflows
+
+### 3.1 Endpoint report generation (`bun src/run.ts`)
+
+```mermaid
+sequenceDiagram
+  participant R as run.ts
+  participant A as runAgent
+  participant C as Composio proxyExecute
+  participant G as Google APIs
+
+  R->>A: endpoints[], composio, connectedAccountId
+  loop For each tool_slug in order
+    A->>A: executeSlug: build path, params, body
+    A->>C: proxyExecute(endpoint, method, …)
+    C->>G: authenticated HTTP
+    G-->>C: status + body
+    C-->>A: status + data
+    A->>A: classify, redact, append EndpointReport
+    A->>A: update ExecCtx (IDs, email)
+  end
+  A-->>R: TestReport
+  R->>R: validate + write report.json
+```
+
+### 3.2 Assignment suite (`bun src/index.ts`)
+
+```mermaid
+flowchart TD
+  Start([runAssignmentSuite]) --> Load[Create Composio client + load toolkit map]
+  Load --> Assert[assertAssignmentAccounts]
+  Assert --> Tests[Sequential tests]
+  Tests --> T1[testGmailSendEmail]
+  T1 --> T2[testGmailReadEmails]
+  T2 --> T3[testCalendarCreateEvent]
+  T3 --> T4[testCalendarListEvents]
+  T4 --> Print[printAssignmentResults]
+  Print --> End([PASS/FAIL list])
+```
+
+This path is **narrower** than `runAgent`: a fixed set of integration checks (send, read, create event, list events) for quick PASS/FAIL feedback.
+
+### 3.3 OpenAI chat CLI (`bun run ai`)
+
+```mermaid
+stateDiagram-v2
+  [*] --> ToolRound: allowTools = true
+  ToolRound --> ModelAuto: chat.completions + tools, tool_choice auto
+  ModelAuto --> PlainReply: no tool_calls
+  PlainReply --> [*]
+
+  ModelAuto --> ExecTools: tool_calls present
+  ExecTools --> SetAllow: runTool for each call
+  SetAllow --> OnlyList: batchIsOnlyGmailList?
+  OnlyList --> ToolRound: true: allowTools stays true
+  OnlyList --> FinalPrep: false: allowTools = false
+
+  FinalPrep --> FinalModel: compress tool messages, tool_choice none
+  FinalModel --> [*]
+```
+
+**Narrative:** The user types a line → messages = system + user → the model may call tools → tools run against Composio → results append as `role: tool` → either another **tool round** (list-only Gmail case) or **one final** natural-language reply without further tools.
+
+### 3.4 Data flow: one user request in the CLI
+
+```mermaid
+flowchart LR
+  U[User line] --> P[augmentIfSummaryRequest]
+  P --> M[messages array]
+  M --> OAI[OpenAI]
+  OAI --> TC{tool_calls?}
+  TC -->|no| OUT[Print content]
+  TC -->|yes| RT[runTool]
+  RT --> CP[composioProxyExecute]
+  CP --> JSON[Tool message JSON]
+  JSON --> M
+  M --> FIN{allowTools?}
+  FIN -->|yes + list-only| OAI
+  FIN -->|no| CMP[Compress + final OAI call]
+  CMP --> OUT
+```
+
+---
+
+## 4. Cross-cutting concerns
+
+| Concern | Approach |
+|---------|----------|
+| **Timeouts** | Wrapped OpenAI calls with `withTimeout`; final stream uses `AbortController` and a ceiling (e.g. 120s). |
+| **Large contexts** | `clip` on tool strings; `shrinkGmailToolResult` for bodies; calendar list simplification + `shrinkToolJsonToHardCap` for the final pass. |
+| **Safety (calendar create)** | Model must pass `user_confirmed_timing: true`; `runTool` rejects create if not true. |
+| **Reporting** | `TestReport.summary` counts must match the four status buckets across all `results` entries. |
+
+---
+
+## 5. Glossary
+
+| Term | Meaning |
+|------|---------|
+| **Connected account id** | Composio’s id for a linked OAuth identity for a **specific toolkit** (not the same as a free-form “user label”). |
+| **proxyExecute** | Composio method: authenticated proxy to vendor HTTP APIs using stored tokens. |
+| **tool_slug** | Stable name for one row in `endpoints.json` and one row in the report. |
+| **EndpointStatus** | `valid` \| `invalid_endpoint` \| `insufficient_scopes` \| `error`. |
+
+---
+
+## 6. Related files
+
+| Topic | Where to look |
+|-------|----------------|
+| Report types | `src/types.ts` |
+| Proxy + `runAgent` + suite | `src/agent.ts` |
+| Chat tools + loop | `src/openai-cli.ts` |
+| Harness validation | `src/run.ts` |
+| Sample endpoint list | `src/endpoints.json` |
+
+This document describes **structure and behavior**. Operational setup is out of scope for this README.

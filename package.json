@@ -5,7 +5,8 @@
     "test:assignment": "bun src/index.ts",
     "test:endpoints": "bun src/run.ts",
     "endpoints:list": "bun src/summarize-endpoints.ts",
-    "connect": "bun src/connect.ts"
+    "connect": "bun src/connect.ts",
+    "ai": "bun src/openai-cli.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -14,6 +15,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@composio/core": "latest"
+    "@composio/core": "latest",
+    "openai": "^6.33.0"
   }
 }
