@@ -5,6 +5,10 @@ This repository combines two related capabilities:
 1. **Endpoint executability validation** — Given structured API endpoint definitions (Gmail + Google Calendar in the sample), the agent calls each through Composio’s authenticated proxy and classifies whether the call succeeded, failed due to missing routes/scopes, or failed for other reasons.
 2. **Natural-language assistant** — A separate CLI uses OpenAI tool-calling to drive the **same** Composio proxy layer for real Gmail and Calendar actions (list/read/send mail, list/create calendar events).
 
+[![Watch the demo-1]([https://cdn.loom.com/sessions/YOUR_THUMBNAIL_ID-with-play.gif](https://www.loom.com/share/14eae6f169524f578c947d60a6bdbd62))](YOUR_LOOM_LINK 1)
+
+[![Watch the demo-2[]([https://cdn.loom.com/sessions/YOUR_THUMBNAIL_ID-with-play.gif](https://www.loom.com/share/9c2002d1bbec4514a7d7392c242a71e8)](https://www.loom.com/share/14eae6f169524f578c947d60a6bdbd62))](YOUR_LOOM_LINK 2)
+
 The sections below describe **high-level design (HLD)**, **low-level design (LLD)**, and **workflows** in plain language. Setup steps and environment variables are intentionally omitted here.
 
 ---
